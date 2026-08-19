@@ -203,6 +203,7 @@ def _load_config():
         "rate_limit_min": 1,
         "rate_limit_max": 2,
         "rate_limit_cooldown": 60,
+        "max_rate_limit_wait": 86400,
         "tool_cooldown_min": 0.5,
         "tool_cooldown_max": 1.0,
     }
@@ -227,6 +228,7 @@ def _load_config():
         "rate_limit_min": float(_os.environ.get("RATE_LIMIT_MIN", defaults["rate_limit_min"])),
         "rate_limit_max": float(_os.environ.get("RATE_LIMIT_MAX", defaults["rate_limit_max"])),
         "rate_limit_cooldown": int(_os.environ.get("RATE_LIMIT_COOLDOWN", defaults["rate_limit_cooldown"])),
+        "max_rate_limit_wait": int(_os.environ.get("MAX_RATE_LIMIT_WAIT", defaults["max_rate_limit_wait"])),
         "tool_cooldown_min": float(_os.environ.get("TOOL_COOLDOWN_MIN", defaults["tool_cooldown_min"])),
         "tool_cooldown_max": float(_os.environ.get("TOOL_COOLDOWN_MAX", defaults["tool_cooldown_max"])),
     }
@@ -239,6 +241,7 @@ _global_rate_lock = _asyncio.Lock()
 _RATE_LIMIT_MIN = _config["rate_limit_min"]
 _RATE_LIMIT_MAX = _config["rate_limit_max"]
 _RATE_LIMIT_COOLDOWN = _config["rate_limit_cooldown"]
+_MAX_RATE_LIMIT_WAIT = _config["max_rate_limit_wait"]
 _TOOL_COOLDOWN_MIN = _config["tool_cooldown_min"]
 _TOOL_COOLDOWN_MAX = _config["tool_cooldown_max"]
 
@@ -449,18 +452,24 @@ class SwarmAgent:
         # Ensure chat exists (created once per run)
         await self._ensure_chat()
 
-        response = None
-        max_retries = 6
-        base_delay = 2
+        global _global_last_request_time
 
-        for i in range(max_retries):
+        response = None
+        max_error_attempts = 6      # genuine failures: bounded
+        base_delay = 2
+        error_attempts = 0
+        rate_limit_waited = 0       # quota replenishes: bounded by total wait, not attempts
+        attempt = 0
+
+        while True:
             try:
                 # Global rate limit across all agents
                 await _global_throttle()
 
-                print(f"[{self.name}] Sending to Gemini (Attempt {i+1}/{max_retries})...")
-                if i > 0:
-                     self.bus.log_event("System", "INFO", f"Retrying API (Attempt {i+1}/{max_retries})...")
+                attempt += 1
+                print(f"[{self.name}] Sending to Gemini (Attempt {attempt})...")
+                if attempt > 1:
+                     self.bus.log_event("System", "INFO", f"Retrying API (Attempt {attempt})...")
 
                 res = self.chat.send_message(prompt)
                 if inspect.isawaitable(res):
@@ -482,28 +491,45 @@ class SwarmAgent:
                 print(f"[{self.name}] API Error: {error_str}")
                 self.bus.log_event("System", "ERROR", f"API Error: {error_str[:100]}...")
                 
-                if i == max_retries - 1:
-                    print(f"[{self.name}] Max retries reached.")
-                    self.bus.log_event("System", "CRITICAL", "Max retries reached. Giving up.")
-                    break
-
                 is_429 = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
-                sleep_time = _RATE_LIMIT_COOLDOWN if is_429 else (base_delay * (2 ** i))
 
                 if is_429:
-                    print(f"[{self.name}] Rate limit hit. Cooling down for {sleep_time // 60} minutes...")
-                    self.bus.log_event("System", "WARNING", f"Rate Limit Hit. Cooling down for {sleep_time}s...")
-                    # Penalty Box: Push global timer forward to stop other agents
+                    # Quota replenishes, so waiting is the correct response. Spending
+                    # a bounded retry budget on rate limits abandons the agent's step,
+                    # which drops a passage and desynchronises the graph from the
+                    # source — an infrastructure artefact, not a result.
+                    if rate_limit_waited + _RATE_LIMIT_COOLDOWN > _MAX_RATE_LIMIT_WAIT:
+                        print(f"[{self.name}] Rate limited {rate_limit_waited}s total; budget exhausted.")
+                        self.bus.log_event("System", "CRITICAL",
+                                           f"Rate limited {rate_limit_waited}s (budget {_MAX_RATE_LIMIT_WAIT}s). Giving up.")
+                        break
+
+                    sleep_time = _RATE_LIMIT_COOLDOWN
+                    rate_limit_waited += sleep_time
+                    print(f"[{self.name}] Rate limit hit. Cooling down for {sleep_time // 60} minutes "
+                          f"({rate_limit_waited // 60}m of {_MAX_RATE_LIMIT_WAIT // 60}m budget used)...")
+                    self.bus.log_event("System", "WARNING",
+                                       f"Rate Limit Hit. Cooling down for {sleep_time}s (total {rate_limit_waited}s)...")
+                    # Penalty Box: push the global timer forward so the other agents
+                    # stop calling too, instead of burning the same exhausted quota.
                     async with _global_rate_lock:
                         _global_last_request_time = _time.time() + sleep_time
-                
+                else:
+                    error_attempts += 1
+                    if error_attempts >= max_error_attempts:
+                        print(f"[{self.name}] Max retries reached.")
+                        self.bus.log_event("System", "CRITICAL", "Max retries reached. Giving up.")
+                        break
+                    sleep_time = base_delay * (2 ** (error_attempts - 1))
+
                 await asyncio.sleep(sleep_time)
 
         if not response:
             print(f"[{self.name}] No response from Gemini.")
             self.bus.log_event("System", "ERROR", "No response from Gemini API after retries")
             # NEVER move on with incomplete state - raise so caller can handle
-            raise RuntimeError(f"[{self.name}] No response from Gemini API after {max_retries} retries")
+            raise RuntimeError(f"[{self.name}] No response from Gemini API "
+                               f"({error_attempts} errors, {rate_limit_waited}s rate-limited)")
 
         if not response.parts:
              print(f"[{self.name}] Empty response (Safety?)")
@@ -573,7 +599,9 @@ class SwarmAgent:
             # Retry loop for tool outputs (same as initial message)
             tool_response = None
             last_error = None
-            for retry in range(6):
+            tool_error_attempts = 0
+            tool_rate_limit_waited = 0
+            while True:
                 try:
                     # Global rate limit across all agents
                     await _global_throttle()
@@ -593,16 +621,26 @@ class SwarmAgent:
                     error_str = str(e)
                     last_error = e
                     is_429 = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
-                    if is_429 and retry < 5:
+                    if is_429:
+                        # Same reasoning as the message loop: wait quota out rather
+                        # than abandoning the turn mid-tool-call.
+                        if tool_rate_limit_waited + _RATE_LIMIT_COOLDOWN > _MAX_RATE_LIMIT_WAIT:
+                            print(f"[{self.name}] Tool output rate limited {tool_rate_limit_waited}s; budget exhausted.")
+                            break
                         sleep_time = _RATE_LIMIT_COOLDOWN
-                        print(f"[{self.name}] Tool output rate limit. Cooling down for {sleep_time // 60} minutes...")
-                        # Penalty Box: Push global timer forward to stop other agents
+                        tool_rate_limit_waited += sleep_time
+                        print(f"[{self.name}] Tool output rate limit. Cooling down for {sleep_time // 60} minutes "
+                              f"({tool_rate_limit_waited // 60}m of {_MAX_RATE_LIMIT_WAIT // 60}m budget used)...")
+                        # Penalty Box: push the global timer forward to stop other agents
                         async with _global_rate_lock:
                             _global_last_request_time = _time.time() + sleep_time
                         await asyncio.sleep(sleep_time)
                     else:
+                        tool_error_attempts += 1
                         print(f"[{self.name}] Error sending tool output: {e}")
-                        break
+                        if tool_error_attempts >= 6:
+                            break
+                        await asyncio.sleep(2 * (2 ** (tool_error_attempts - 1)))
 
             if not tool_response:
                 # NEVER move on with incomplete state - raise so caller can handle
